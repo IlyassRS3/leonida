@@ -400,24 +400,69 @@ def parse_junit(xml):
     return out
 
 
+def _trailer_end_time_matches(lines: list[str], end_of_output_index: int, name: str) -> bool:
+    """True when the immediate CTest trailer after `<end of output>` ends with `\"<name>\" end time: `."""
+    sep = "-" * 58
+    separators = 0
+    expected = f'"{name}" end time: '
+    for line in lines[end_of_output_index + 1:]:
+        if line == sep:
+            separators += 1
+            if separators >= 2:
+                return False
+            continue
+        if line.startswith('"') and '" end time: ' in line:
+            return line.startswith(expected)
+        if line == "<end of output>" or line == "Output:" or line.startswith(("Start testing: ", "End testing: ")):
+            return False
+        if re.match(r"^\d+/\d+ Test: ", line):
+            return False
+    return False
+
+
 def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
     """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log."""
+    sep = "-" * 58
+    test_re = re.compile(r"^\d+/\d+ Test: (.+)$")
     out, name, secs = [], None, None
     captured = False
-    nested_runs = 0
+    # Stack of [in_output, inner_test_name] for nested `Start testing:` runs inside captured output.
+    nested: list[list[object]] = []
     lines = text.splitlines()
     for index, line in enumerate(lines):
         next_line = lines[index + 1] if index + 1 < len(lines) else ""
         if captured:
-            # CTest writes child output verbatim, so it can contain complete nested logs.
-            if line.startswith("Start testing: ") and next_line == "-" * 58:
-                nested_runs += 1
-            elif nested_runs and line.startswith("End testing: "):
-                nested_runs -= 1
-            elif not nested_runs and line == "<end of output>" and next_line.startswith("Test time ="):
-                captured = False
+            # CTest writes child output verbatim, so it can contain complete or truncated nested logs.
+            if line.startswith("Start testing: ") and next_line == sep:
+                nested.append([False, None])
+            elif nested and not nested[-1][0]:
+                m = test_re.match(line)
+                if m:
+                    nested[-1][1] = m.group(1).strip()
+                elif line == "Output:" and next_line == sep:
+                    nested[-1][0] = True
+                elif line.startswith("End testing: "):
+                    nested.pop()
+                elif line == "<end of output>" and next_line.startswith("Test time ="):
+                    # No inner Output: block is open, so unwind any nested runs that omitted `End testing:`.
+                    while nested and not nested[-1][0]:
+                        nested.pop()
+                    if not nested:
+                        captured = False
+                    else:
+                        nested[-1][0] = False
+            elif line == "<end of output>" and next_line.startswith("Test time ="):
+                if not nested:
+                    captured = False
+                elif (len(nested) == 1 and nested[0][1] is not None and nested[0][1] != name
+                      and _trailer_end_time_matches(lines, index, name)):
+                    # Inner test output was truncated before its own `<end of output>`; this trailer is the outer test's.
+                    nested.clear()
+                    captured = False
+                else:
+                    nested[-1][0] = False
             continue
-        m = re.match(r"^\d+/\d+ Test: (.+)$", line)
+        m = test_re.match(line)
         if m:
             name, secs = m.group(1).strip(), None
             continue
@@ -425,6 +470,7 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             continue
         if line == "Output:":
             captured = True
+            nested.clear()
             continue
         m = re.match(r"^Test time =\s*([\d.]+) sec", line)
         if m:
