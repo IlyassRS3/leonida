@@ -403,25 +403,26 @@ def parse_junit(xml):
 _CTEST_HEADER_RE = re.compile(r"^\d+/\d+ Test: (.+)$")
 
 
-def _trailer_end_time_matches(lines: list[str], end_of_output_index: int, name: str) -> bool:
-    """True when the immediate CTest trailer after `<end of output>` ends with `\"<name>\" end time: `."""
+def _trailer_end_time_name(lines: list[str], end_of_output_index: int) -> str | None:
+    """Return `<name>` from the immediate CTest trailer's `\"<name>\" end time: ` line, or None."""
     sep = "-" * 58
     separators = 0
-    expected = f'"{name}" end time: '
     for idx in range(end_of_output_index + 1, len(lines)):
         line = lines[idx]
         if line == sep:
             separators += 1
             if separators >= 2:
-                return False
+                return None
             continue
-        if line.startswith('"') and '" end time: ' in line:
-            return line.startswith(expected)
+        if line.startswith('"'):
+            marker = line.rfind('" end time: ')
+            if marker > 0:
+                return line[1:marker]
         if line == "<end of output>" or line == "Output:" or line.startswith(("Start testing: ", "End testing: ")):
-            return False
+            return None
         if _CTEST_HEADER_RE.match(line):
-            return False
-    return False
+            return None
+    return None
 
 
 def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
@@ -438,6 +439,29 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             # CTest writes child output verbatim, so it can contain complete or truncated nested logs.
             if line.startswith("Start testing: ") and next_line == sep:
                 nested.append([False, None])
+            elif line == "<end of output>" and next_line.startswith("Test time ="):
+                # Unwind any nested runs whose Output: block is already closed (or never opened) and omitted End testing:.
+                while nested and not nested[-1][0]:
+                    nested.pop()
+                if not nested:
+                    captured = False
+                else:
+                    trailer_name = _trailer_end_time_name(lines, index)
+                    matched_depth = None
+                    if trailer_name is not None:
+                        for depth in range(len(nested) - 1, -1, -1):
+                            if nested[depth][1] == trailer_name:
+                                matched_depth = depth
+                                break
+                    if matched_depth is not None:
+                        del nested[matched_depth + 1:]
+                        nested[matched_depth][0] = False
+                    elif trailer_name is not None and trailer_name == name:
+                        # All open nested Output: blocks were truncated before their own `<end of output>`.
+                        nested.clear()
+                        captured = False
+                    else:
+                        nested[-1][0] = False
             elif nested and not nested[-1][0]:
                 m = _CTEST_HEADER_RE.match(line)
                 if m:
@@ -446,24 +470,6 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
                     nested[-1][0] = True
                 elif line.startswith("End testing: "):
                     nested.pop()
-                elif line == "<end of output>" and next_line.startswith("Test time ="):
-                    # No inner Output: block is open, so unwind any nested runs that omitted `End testing:`.
-                    while nested and not nested[-1][0]:
-                        nested.pop()
-                    if not nested:
-                        captured = False
-                    else:
-                        nested[-1][0] = False
-            elif line == "<end of output>" and next_line.startswith("Test time ="):
-                if not nested:
-                    captured = False
-                elif (len(nested) == 1 and nested[0][1] is not None and nested[0][1] != name
-                      and _trailer_end_time_matches(lines, index, name)):
-                    # Inner test output was truncated before its own `<end of output>`; this trailer is the outer test's.
-                    nested.clear()
-                    captured = False
-                else:
-                    nested[-1][0] = False
             continue
         m = _CTEST_HEADER_RE.match(line)
         if m:

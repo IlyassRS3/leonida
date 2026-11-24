@@ -215,6 +215,45 @@ class Tests(unittest.TestCase):
         )
         self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 0.4), ("later", "pass", 0.03)])
 
+    def test_lasttest_recovers_when_multi_level_nested_output_is_truncated_mid_leaf(self) -> None:
+        sep = "-" * 58
+        ts = "Nov 24 21:40 UTC"
+        middle_truncated_in_leaf = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: middle\nOutput:\n{sep}\n"
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: leaf\nOutput:\n{sep}\n"
+            f"leaf payload"
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Test: wrapper\nOutput:\n{sep}\n{middle_truncated_in_leaf}\n<end of output>\n"
+            f'Test time =   0.25 sec\n{sep}\nTest Failed.\n"wrapper" end time: {ts}\n{sep}\n\n'
+            f"2/2 Test: later\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.04 sec\n{sep}\nTest Passed.\n"later" end time: {ts}\n{sep}\n\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "fail", 0.25), ("later", "pass", 0.04)])
+
+    def test_lasttest_recovers_when_middle_finishes_after_truncated_leaf(self) -> None:
+        sep = "-" * 58
+        ts = "Nov 24 21:40 UTC"
+        middle_with_truncated_leaf = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: middle\nOutput:\n{sep}\n"
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/1 Test: leaf\nOutput:\n{sep}\n"
+            f"leaf payload\n<end of output>\n"
+            f'Test time =   0.10 sec\n{sep}\nTest Failed.\n"middle" end time: {ts}\n{sep}\nEnd testing: {ts}'
+        )
+        log = (
+            f"Start testing: {ts}\n{sep}\n"
+            f"1/2 Test: wrapper\nOutput:\n{sep}\n{middle_with_truncated_leaf}\n<end of output>\n"
+            f'Test time =   0.35 sec\n{sep}\nTest Passed.\n"wrapper" end time: {ts}\n{sep}\n\n'
+            f"2/2 Test: later\nOutput:\n{sep}\nok\n<end of output>\n"
+            f'Test time =   0.05 sec\n{sep}\nTest Passed.\n"later" end time: {ts}\n{sep}\n\nEnd testing: {ts}\n'
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("wrapper", "pass", 0.35), ("later", "pass", 0.05)])
+
     def test_lasttest_ignores_spurious_end_testing_inside_nested_test_output(self) -> None:
         sep = "-" * 58
         ts = "Nov 24 20:47 UTC"
