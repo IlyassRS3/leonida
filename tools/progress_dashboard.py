@@ -400,12 +400,16 @@ def parse_junit(xml):
     return out
 
 
+_CTEST_HEADER_RE = re.compile(r"^\d+/\d+ Test: (.+)$")
+
+
 def _trailer_end_time_matches(lines: list[str], end_of_output_index: int, name: str) -> bool:
     """True when the immediate CTest trailer after `<end of output>` ends with `\"<name>\" end time: `."""
     sep = "-" * 58
     separators = 0
     expected = f'"{name}" end time: '
-    for line in lines[end_of_output_index + 1:]:
+    for idx in range(end_of_output_index + 1, len(lines)):
+        line = lines[idx]
         if line == sep:
             separators += 1
             if separators >= 2:
@@ -415,7 +419,7 @@ def _trailer_end_time_matches(lines: list[str], end_of_output_index: int, name: 
             return line.startswith(expected)
         if line == "<end of output>" or line == "Output:" or line.startswith(("Start testing: ", "End testing: ")):
             return False
-        if re.match(r"^\d+/\d+ Test: ", line):
+        if _CTEST_HEADER_RE.match(line):
             return False
     return False
 
@@ -423,7 +427,6 @@ def _trailer_end_time_matches(lines: list[str], end_of_output_index: int, name: 
 def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
     """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log."""
     sep = "-" * 58
-    test_re = re.compile(r"^\d+/\d+ Test: (.+)$")
     out, name, secs = [], None, None
     captured = False
     # Stack of [in_output, inner_test_name] for nested `Start testing:` runs inside captured output.
@@ -436,7 +439,7 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             if line.startswith("Start testing: ") and next_line == sep:
                 nested.append([False, None])
             elif nested and not nested[-1][0]:
-                m = test_re.match(line)
+                m = _CTEST_HEADER_RE.match(line)
                 if m:
                     nested[-1][1] = m.group(1).strip()
                 elif line == "Output:" and next_line == sep:
@@ -462,7 +465,7 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
                 else:
                     nested[-1][0] = False
             continue
-        m = test_re.match(line)
+        m = _CTEST_HEADER_RE.match(line)
         if m:
             name, secs = m.group(1).strip(), None
             continue
