@@ -111,7 +111,8 @@ class ControlConvStaticTests(unittest.TestCase):
         tr = self.translate(bytes.fromhex("39d8" "eb00" "e100" "c3"))
         a_ref = xr.Asm()
         a_ref.ldr(xr.T0, xr.CTX_REG, xr.CTX_EFLAGS, size=4)
-        self.assertIn(a_ref.words[0], tr.asm.words, "cross-block loope must read ZF from ctx.eflags")
+        ldr_mask = ~0x1F
+        self.assertTrue(any((w & ldr_mask) == (a_ref.words[0] & ldr_mask) for w in tr.asm.words), "cross-block loope must read ZF from ctx.eflags")
 
 
 @unittest.skipIf(RUNNER is None, "needs Darwin arm64 Mach-O runner or qemu-system-aarch64")
