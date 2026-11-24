@@ -192,7 +192,7 @@ class BitopsExecTests(unittest.TestCase):
             "0f ba 2e 23",                                  # bts dword [rsi], 35 -> [rsi+0]=0x08
             "11 ff",                                        # adc edi, edi (0)
             # Verify memory bytes: [rsi-2]==0x80, [rsi-1]==0x00, [rsi+0]==0x08, [rsi+4]==0x00
-            "0f b6 46 fe", "83 f0 80",                      # [rsi-2] ^ 0x80
+            "0f b6 46 fe", "35 80 00 00 00",                # [rsi-2] ^ 0x80 (imm32; 83 f0 80 sign-extends to -128)
             "0f b6 56 ff", "09 d0",                         # | [rsi-1]
             "0f b6 16", "83 f2 08", "09 d0",                # | ([rsi+0] ^ 0x08)
             "0f b6 56 04", "09 d0",                         # | [rsi+4]
