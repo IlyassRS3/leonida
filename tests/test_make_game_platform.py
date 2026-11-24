@@ -284,8 +284,8 @@ class RuntimePackagingTest(unittest.TestCase):
         os.symlink(sys.executable, os.path.join(proton, "wine"))
         relative = dict(env, WINE=os.path.join("Proton 9.0", "files", "bin", "wine"))
         result = subprocess.check_output([launcher, "--dry-run"], cwd=self.root, env=relative)
-        self.assertEqual(json.loads(result)[:2], [self.game, ["--dry-run", "./" + image, "--overlay",
-                                                              "Z:" + self.out + "/overlay"]])
+        self.assertEqual(json.loads(result)[:2], [real(self.game), ["--dry-run", "./" + image, "--overlay",
+                                                                    "Z:" + real(self.out) + "/overlay"]])
 
         work = os.path.join(self.out, "Shader cache '$HOME'")
         make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build, work=work)
