@@ -4,7 +4,7 @@
   python -I scripts/run_guest_scene.py --loader L --guest G --shaders ROOT [--out DIR] [--wine WINE]
                                        [--play-audio] [--negative-controls]
 
---wine defaults to $WINE (e.g. UMU-Proton's files/bin/wine); outside Windows one of the two is required.
+Outside Windows, --wine defaults to $WINE (e.g. UMU-Proton's files/bin/wine) and one of the two is required.
 
 Each run renders offscreen in a fresh process and write overlay. Without --out the runs go to a temporary folder that is removed
 afterwards. The summary is printed first, and on failure the last run's log tails are printed too. Audio stays offline
@@ -326,14 +326,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--guest", type=Path, required=True)
     ap.add_argument("--shaders", type=Path, required=True, help="shader root containing spirv/")
     ap.add_argument("--out", type=Path, help="new or empty folder (default: a temporary folder, removed afterwards)")
-    ap.add_argument("--wine", default=os.environ.get("WINE") or None,
-                    help="run the loader through this Wine binary (default: $WINE)")
+    ap.add_argument("--wine", default=(os.environ.get("WINE") or None) if os.name != "nt" else None,
+                    help="run the loader through this Wine binary (default: $WINE outside Windows)")
     ap.add_argument("--wine-arg", action="append", default=[], help="argument to the Wine launcher (repeatable)")
     ap.add_argument("--play-audio", action="store_true", help="LEONIDA_SCENE_AUDIO=winmm instead of offline")
     ap.add_argument("--negative-controls", action="store_true", help="also run a bad scene.bin and checkpoint")
     args = ap.parse_args()
     if args.wine_arg and not args.wine:
-        ap.error("--wine-arg requires --wine or WINE")
+        ap.error("--wine-arg requires --wine" if os.name == "nt" else "--wine-arg requires --wine or WINE")
     for name in ("loader", "guest"):
         if not getattr(args, name).is_file():
             ap.error(f"--{name}: no such file")
