@@ -87,7 +87,59 @@ static int test_header() {
     return 0;
 }
 
+static int test_checkpoint_schedule() {
+    using store::CheckpointOutcome;
+    using store::CheckpointSchedule;
+
+    CheckpointSchedule schedule(120000, 120000);
+    CHECK(!schedule.in_progress());
+    CHECK(!schedule.try_claim(0));
+    CHECK(!schedule.try_claim(119999));
+
+    // At the due time, one caller claims the slot; concurrent callers see in_progress and are coalesced.
+    CHECK(schedule.try_claim(120000));
+    CHECK(schedule.in_progress());
+    CHECK(!schedule.try_claim(120000));
+    CHECK(!schedule.try_claim(240000));
+
+    // A deferred checkpoint (active compile or waiter) must NOT burn the 120 s cooldown: it becomes immediately
+    // eligible on the next compile completion.
+    schedule.complete(120050, CheckpointOutcome::deferred);
+    CHECK(!schedule.in_progress());
+    CHECK(schedule.next_due_ms() == 120050);
+    CHECK(!schedule.try_claim(120049));
+    CHECK(schedule.try_claim(120050));
+
+    // Queue failure (abort_claim) also preserves immediate retry without burning the cooldown.
+    schedule.abort_claim(120060);
+    CHECK(!schedule.in_progress());
+    CHECK(schedule.next_due_ms() == 120060);
+    CHECK(schedule.try_claim(120060));
+
+    // A saved snapshot advances the deadline by interval_ms.
+    schedule.complete(125000, CheckpointOutcome::saved);
+    CHECK(!schedule.in_progress());
+    CHECK(schedule.next_due_ms() == 245000);
+    CHECK(!schedule.try_claim(244999));
+    CHECK(schedule.try_claim(245000));
+
+    // A skipped snapshot (empty cache, over limit, or I/O error) backs off by interval_ms so disk is not hammered.
+    schedule.complete(245010, CheckpointOutcome::skipped);
+    CHECK(schedule.next_due_ms() == 365010);
+    CHECK(!schedule.try_claim(365009));
+
+    // Near-UINT64_MAX timestamps saturate below the in_flight sentinel rather than wrapping or sticking in_flight.
+    const std::uint64_t near_max = (std::numeric_limits<std::uint64_t>::max)() - 10;
+    CheckpointSchedule hi(near_max, 120000);
+    CHECK(hi.try_claim(near_max));
+    hi.complete(near_max, CheckpointOutcome::saved);
+    CHECK(!hi.in_progress());
+    CHECK(hi.next_due_ms() == (std::numeric_limits<std::uint64_t>::max)() - 1);
+    return 0;
+}
+
 int main() {
     if (const int failed = test_limit()) return failed;
-    return test_header();
+    if (const int failed = test_header()) return failed;
+    return test_checkpoint_schedule();
 }
