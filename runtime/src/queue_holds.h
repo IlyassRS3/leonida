@@ -66,9 +66,8 @@ public:
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            PumpScope scope(this);  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
         }
         pump_ready();
     }
@@ -160,23 +159,39 @@ public:
     // whose held work is all gone.
     void pump_ready() {
         if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) return;
-        dirty_.store(true, std::memory_order_release);
-        if (in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
-        for (;;) {
-            std::unique_lock pump(pump_mutex_, std::try_to_lock);
-            if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
-            while (dirty_.exchange(false, std::memory_order_acq_rel)) {
-                bool progress = true;
-                while (progress) {
-                    progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
-                }
-                run_barriers();
+        {
+            std::lock_guard lock(mutex_);
+            dirty_ = true;
+            if (in_pump() || pump_active_) return;  // this thread or another is releasing and will see dirty_
+            pump_active_ = true;
+        }
+        struct ActiveGuard {
+            QueueHolds* self;
+            bool active = true;
+            ~ActiveGuard() {
+                if (!active) return;
+                std::lock_guard lock(self->mutex_);
+                self->pump_active_ = false;
             }
-            in_pump() = false;
-            pump.unlock();
-            if (!dirty_.load(std::memory_order_acquire)) return;
+        } active_guard{this};
+        std::lock_guard pump(pump_mutex_);
+        PumpScope scope(this);
+        for (;;) {
+            {
+                std::lock_guard lock(mutex_);
+                if (!dirty_) {
+                    pump_active_ = false;
+                    active_guard.active = false;
+                    return;
+                }
+                dirty_ = false;
+            }
+            bool progress = true;
+            while (progress) {
+                progress = false;
+                for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            }
+            run_barriers();
         }
     }
 
@@ -187,9 +202,28 @@ private:
         std::function<void()> fn;
     };
 
-    static bool& in_pump() {
-        static thread_local bool pumping = false;
-        return pumping;
+    // Per-instance re-entrancy guard on the current thread's stack: zero heap allocation, exception-safe, and
+    // distinct QueueHolds instances nested on the same thread do not suppress each other.
+    struct PumpScope {
+        const QueueHolds* owner;
+        PumpScope* previous;
+        explicit PumpScope(const QueueHolds* self) noexcept : owner(self), previous(active_scope()) {
+            active_scope() = this;
+        }
+        ~PumpScope() noexcept { active_scope() = previous; }
+        PumpScope(const PumpScope&) = delete;
+        PumpScope& operator=(const PumpScope&) = delete;
+    };
+
+    static PumpScope*& active_scope() noexcept {
+        static thread_local PumpScope* top = nullptr;
+        return top;
+    }
+
+    bool in_pump() const noexcept {
+        for (const PumpScope* s = active_scope(); s != nullptr; s = s->previous)
+            if (s->owner == this) return true;
+        return false;
     }
 
     std::vector<Holder*> snapshot() const {
@@ -229,7 +263,8 @@ private:
     std::atomic<std::int64_t> held_{0};
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};
-    std::atomic<bool> dirty_{false};
+    bool dirty_ = false;
+    bool pump_active_ = false;
 };
 
 }  // namespace leonida
