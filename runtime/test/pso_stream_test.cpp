@@ -44,6 +44,7 @@ std::size_t payload_of_type(const std::vector<unsigned char>& s, unsigned wanted
         if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) { size = sizeof(D3D12_BLEND_DESC); align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK) { size = 4; align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER) { size = sizeof(D3D12_RASTERIZER_DESC); align = 4; }
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1) { size = sizeof(D3D12_RASTERIZER_DESC1); align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) { size = sizeof(D3D12_DEPTH_STENCIL_DESC1); align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) { size = 8; align = 8; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) { size = sizeof(D3D12_INPUT_LAYOUT_DESC); align = 8; }
@@ -254,6 +255,52 @@ void test_refusals() {
           "a stream with an unmodelled subobject type is not captured");
 }
 
+void test_console_stream_normalization() {
+    // Console numbering has no gap at 23: MS is 24 (PC AS) and RASTERIZER1 is 26 (PC DEPTH_STENCIL2).
+    // Placing console tag 26 last ensures PC walking fails on size (DEPTH_STENCIL2 > RASTERIZER1), while console
+    // capture succeeds, rewrites tags to canonical PC numbering (25 = MS, 27 = RASTERIZER1), deep-copies the mesh
+    // bytecode, and allows subsequent PC-tag slot-55 derivation.
+    StreamBuilder s;
+    ID3D12RootSignature* root = nullptr;
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, 8, 8);
+    D3D12_SHADER_BYTECODE ms{kVsCode, sizeof(kVsCode)};
+    s.entry(24u, &ms, sizeof(ms), 8);
+    UINT mask = 0xffffffffu;
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &mask, 4, 4);
+    D3D12_RASTERIZER_DESC1 raster1{};
+    raster1.FillMode = D3D12_FILL_MODE_SOLID;
+    raster1.CullMode = D3D12_CULL_MODE_NONE;
+    raster1.DepthClipEnable = TRUE;
+    s.entry(26u, &raster1, sizeof(raster1), 4);
+
+    check(rt::d3d12_xs::PsoStreamRecord::capture({s.bytes.size(), s.bytes.data()}, false) == nullptr,
+          "console tag 26 (RASTERIZER1) is rejected when walked as PC DEPTH_STENCIL2");
+    auto rec = rt::d3d12_xs::PsoStreamRecord::capture({s.bytes.size(), s.bytes.data()}, true);
+    check(rec != nullptr, "console-numbered mesh + RASTERIZER1 stream captures with console=true");
+    if (!rec) return;
+
+    const std::size_t ms_off = payload_of_type(rec->bytes(), D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS);
+    const std::size_t r1_off = payload_of_type(rec->bytes(), D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1);
+    check(ms_off != static_cast<std::size_t>(-1), "console tag 24 is normalized to PC MS (25)");
+    check(r1_off != static_cast<std::size_t>(-1), "console tag 26 is normalized to PC RASTERIZER1 (27)");
+    if (ms_off != static_cast<std::size_t>(-1)) {
+        D3D12_SHADER_BYTECODE ms_copy{};
+        std::memcpy(&ms_copy, rec->bytes().data() + ms_off, sizeof(ms_copy));
+        check(ms_copy.pShaderBytecode != kVsCode && ms_copy.BytecodeLength == sizeof(kVsCode) &&
+                  std::memcmp(ms_copy.pShaderBytecode, kVsCode, sizeof(kVsCode)) == 0,
+              "normalized console MS bytecode is deep-copied");
+    }
+
+    UINT patched_mask = 0x5u;
+    auto r3 = record(3, &patched_mask, sizeof(patched_mask));
+    std::vector<unsigned char> derived;
+    check(rt::d3d12_xs::derive_stream(*rec, r3.data(), 1, derived) == rt::d3d12_xs::DeriveStatus::ok,
+          "slot 55 derives from a normalized console stream");
+    const std::size_t mp = payload_of_type(derived, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK);
+    check(mp != static_cast<std::size_t>(-1) && std::memcmp(derived.data() + mp, &patched_mask, 4) == 0,
+          "derived console stream updates SAMPLE_MASK");
+}
+
 }  // namespace
 
 int main() {
@@ -263,6 +310,7 @@ int main() {
     test_derive_single_and_all_tags();
     test_stencil_mask_record();
     test_refusals();
+    test_console_stream_normalization();
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
 }

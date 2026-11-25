@@ -5657,12 +5657,16 @@ void keep_pso_stream(IUnknown* pso, const D3D12_PIPELINE_STATE_STREAM_DESC& desc
 HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
                                void** out, std::unique_ptr<PsoStreamRecord> derived = {}) {
     if (!riid) return E_POINTER;
-    if (self->prepare_stream && desc && out && IsEqualIID(*riid, __uuidof(ID3D12PipelineState)))
-        return self->prepare_stream(self->real, *desc, *riid, out, std::move(derived));
-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
     used_console_stream = false;
     d3d12_trace::stream_refusal = nullptr;
-    const HRESULT hr = reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    const bool prepared = self->prepare_stream && desc && out && IsEqualIID(*riid, __uuidof(ID3D12PipelineState));
+    HRESULT hr;
+    if (prepared) {
+        hr = self->prepare_stream(self->real, *desc, *riid, out, std::move(derived));
+    } else {
+        using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+        hr = reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    }
     static const bool audit = [] {
         char value[2]{};
         return GetEnvironmentVariableA("LEONIDA_PSO_STREAM_AUDIT", value, sizeof(value)) == 1 && value[0] == '1';
@@ -5672,7 +5676,7 @@ HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STR
             audit_pso_stream(*desc, hr, used_console_stream);
         } catch (const std::bad_alloc&) {}
     }
-    if (SUCCEEDED(hr) && out && *out && desc) keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
+    if (!prepared && SUCCEEDED(hr) && out && *out && desc) keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
     return hr;
 }
 

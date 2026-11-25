@@ -7998,6 +7998,34 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     return S_OK;
 }
 
+// A stream the PC reading refuses, or leaves with an AS and no MS (no valid PC stream), is read again with the
+// console's numbering (parse_pipeline_stream), and that reading is taken when it holds a mesh shader (its 24) and no
+// AS. A stream the PC reading accepts as valid is never read differently. LEONIDA_XS_STREAM_ENUM=pc keeps the PC
+// reading alone (such PSOs are then refused, as before).
+HRESULT parse_pipeline_stream_any(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& stream,
+                                  bool* used_console = nullptr) {
+    if (used_console) *used_console = false;
+    d3d12_trace::stream_refusal = nullptr;
+    d3d12_xs::used_console_stream = false;
+    HRESULT parsed = parse_pipeline_stream(desc, stream);
+    if ((FAILED(parsed) || (stream.as.pShaderBytecode && !stream.ms.pShaderBytecode)) &&
+        console_stream_enum_enabled()) {
+        const char* pc_reason = d3d12_trace::stream_refusal;
+        PipelineStream console;
+        if (SUCCEEDED(parse_pipeline_stream(desc, console, true)) && !console.as.pShaderBytecode &&
+            is_mesh_container(console.ms)) {
+            log_once("console pipeline stream: type 24 contains a mesh shader; DXIL kind", 13);
+            d3d12_xs::used_console_stream = true;
+            d3d12_trace::stream_refusal = nullptr;
+            stream = console;
+            if (used_console) *used_console = true;
+            return S_OK;
+        }
+        d3d12_trace::stream_refusal = pc_reason;
+    }
+    return parsed;
+}
+
 // A pipeline state, compute (create_compute) or graphics (create_graphics): each shader is found by the SHA-256 of
 // its FSSM program in the translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 std::atomic<long> live_pipeline_state_count{0};  // live_pipeline_states()
@@ -11567,40 +11595,68 @@ public:
     // hold one compiled backend PSO while either public object lives. The device only holds weak references.
     HRESULT prepare_console_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& source, REFIID iid, void** out,
                                    std::unique_ptr<rt::d3d12_xs::PsoStreamRecord> record) {
-        if (!out)return E_POINTER;*out=nullptr;
+        const auto finish = [](HRESULT hr) {
+            if (hr == E_NOTIMPL)
+                d3d12_trace::record("PipelineStream::Refused", d3d12_trace::stream_refusal ?
+                                    d3d12_trace::stream_refusal : "other backend state");
+            return hr;
+        };
+        if (!out) return E_POINTER;
+        *out = nullptr;
         PipelineStream stream{};
-        if(const auto hr=parse_pipeline_stream(source,stream);FAILED(hr))return hr;
-        const auto* library=state_.library();if(!library)return E_FAIL;
-        const auto verify=[&](const char* name,const D3D12_SHADER_BYTECODE& code) {
-            if(!code.BytecodeLength)return true;
-            if(!code.pShaderBytecode)return false;
-            const std::span<const std::uint8_t> bytes{static_cast<const std::uint8_t*>(code.pShaderBytecode),code.BytecodeLength};
-            const std::string identity=std::string(name)+leonida::sha256_hex(bytes);
-            {std::lock_guard lock(verified_program_mutex_);if(verified_programs_.count(identity))return true;}
-            auto program=leonida::compute_program(bytes);
-            if(program.bytes.empty())return false;
-            bool ambiguous=false;
-            const auto candidates=library->program_candidates(name,program,&ambiguous);
-            if(candidates.empty() || ambiguous)return false;
-            {std::lock_guard lock(verified_program_mutex_);verified_programs_.insert(identity);}
+        bool used_console = false;
+        if (const auto hr = parse_pipeline_stream_any(source, stream, &used_console); FAILED(hr)) return finish(hr);
+        const auto* library = state_.library();
+        if (!library) return E_FAIL;
+        const auto verify = [&](const char* name, const D3D12_SHADER_BYTECODE& code) {
+            if (!code.BytecodeLength) return true;
+            if (!code.pShaderBytecode) return false;
+            const std::span<const std::uint8_t> bytes{static_cast<const std::uint8_t*>(code.pShaderBytecode), code.BytecodeLength};
+            const std::string identity = std::string(name) + leonida::sha256_hex(bytes);
+            {std::lock_guard lock(verified_program_mutex_); if (verified_programs_.count(identity)) return true;}
+            auto program = leonida::compute_program(bytes);
+            if (program.bytes.empty()) return false;
+            bool ambiguous = false;
+            const auto candidates = library->program_candidates(name, program, &ambiguous);
+            if (candidates.empty() || ambiguous) return false;
+            if (std::strcmp(name, "ms") == 0) {
+                bool has_root_window = false;
+                for (const auto* entry : candidates) {
+                    if (entry->graphics_root_window) { has_root_window = true; break; }
+                }
+                if (!has_root_window) return false;
+            }
+            {std::lock_guard lock(verified_program_mutex_); verified_programs_.insert(identity);}
             return true;
         };
-        if(stream.has_cs) {
-            if(!stream.compute.CS.BytecodeLength || !verify("cs",stream.compute.CS))return E_INVALIDARG;
+        if (stream.has_cs) {
+            if (!stream.compute.CS.BytecodeLength || !verify("cs", stream.compute.CS)) return E_INVALIDARG;
         } else {
-            const auto& g=stream.graphics;
-            if(stream.as.BytecodeLength || g.HS.BytecodeLength || g.DS.BytecodeLength)return E_NOTIMPL;
-            if((bool(g.VS.BytecodeLength)==bool(stream.ms.BytecodeLength)) || g.NumRenderTargets>8 ||
-               !verify("vs",g.VS)||!verify("gs",g.GS)||!verify("ms",stream.ms)||!verify("ps",g.PS))return E_INVALIDARG;
+            const auto& g = stream.graphics;
+            if (stream.as.BytecodeLength)
+                return finish(stream_unsupported("amplification shaders are not supported; stream subobject",
+                                                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS));
+            if (g.HS.BytecodeLength || g.DS.BytecodeLength || g.StreamOutput.NumEntries)
+                return finish(stream_unsupported("graphics pipeline stage not supported yet (hull/domain/stream output):", 0));
+            const bool mesh = stream.ms.pShaderBytecode && stream.ms.BytecodeLength;
+            if (mesh && (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksEXT))
+                return finish(stream_unsupported(
+                    "mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1));
+            if (mesh && g.GS.BytecodeLength) return E_INVALIDARG;
+            if ((bool(g.VS.BytecodeLength) == bool(stream.ms.BytecodeLength)) || g.NumRenderTargets > 8 ||
+                !verify("vs", g.VS) || !verify("gs", g.GS) || !verify("ms", stream.ms) || !verify("ps", g.PS))
+                return E_INVALIDARG;
         }
-        if(!record) record=rt::d3d12_xs::PsoStreamRecord::capture(source);
-        if(!record)return E_INVALIDARG;
-        auto* pipeline=new PipelineState(state_);
+        if (!record) record = rt::d3d12_xs::PsoStreamRecord::capture(source, used_console);
+        if (!record) return E_INVALIDARG;
+        auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
-        pipeline->set_cache_key(stream.has_cs?pipeline_key(stream.compute):pipeline_key(stream.graphics));
-        if(!rt::d3d12_xs::attach_pso_record(pipeline,std::move(record))){pipeline->Release();return E_OUTOFMEMORY;}
+        pipeline->set_cache_key(stream.has_cs ? pipeline_key(stream.compute) : pipeline_key(stream.graphics));
+        if (!rt::d3d12_xs::attach_pso_record(pipeline, std::move(record))) { pipeline->Release(); return E_OUTOFMEMORY; }
         pipeline->set_pending_stream(stream.has_cs);
-        return hand_out(pipeline,iid,out);
+        const HRESULT result = hand_out(pipeline, iid, out);
+        if (SUCCEEDED(result) && stream.ms.pShaderBytecode) d3d12_trace::record("PipelineStream::Mesh", "accepted");
+        return result;
     }
     HRESULT shared_native_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc, D3D12_SHADER_BYTECODE mesh,
                                    std::span<const rt::d3d12_xs::PsoStreamRecord::ShaderData> containers,
@@ -13655,27 +13711,7 @@ public:
         *out = nullptr;
         if (!desc) return finish(E_INVALIDARG);
         PipelineStream stream;
-        HRESULT parsed = parse_pipeline_stream(*desc, stream);
-        // A stream the PC reading refuses, or leaves with an AS and no MS (no valid PC stream), is read again with the
-        // console's numbering (parse_pipeline_stream), and that reading is taken when it holds a mesh shader (its 24)
-        // and no AS. A stream the PC reading accepts as valid is never read differently. LEONIDA_XS_STREAM_ENUM=pc
-        // keeps the PC reading alone (such PSOs are then refused, as before).
-        if ((FAILED(parsed) || (stream.as.pShaderBytecode && !stream.ms.pShaderBytecode)) &&
-            console_stream_enum_enabled()) {
-            const char* pc_reason = d3d12_trace::stream_refusal;
-            PipelineStream console;
-            if (SUCCEEDED(parse_pipeline_stream(*desc, console, true)) && !console.as.pShaderBytecode &&
-                is_mesh_container(console.ms)) {
-                log_once("console pipeline stream: type 24 contains a mesh shader; DXIL kind", 13);
-                d3d12_xs::used_console_stream = true;
-                d3d12_trace::stream_refusal = nullptr;
-                stream = console;
-                parsed = S_OK;
-            } else {
-                d3d12_trace::stream_refusal = pc_reason;
-            }
-        }
-        if (FAILED(parsed)) return finish(parsed);
+        if (const HRESULT parsed = parse_pipeline_stream_any(*desc, stream); FAILED(parsed)) return finish(parsed);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)

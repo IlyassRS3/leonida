@@ -23,6 +23,7 @@
 #include "../shims/d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"
 
+#include <string>
 #include <string_view>
 #include <array>
 #include <cstring>
@@ -124,7 +125,8 @@ int main(int argc, char** argv) {
     ms_container[36 + 8 + 2] = 13;  // DXIL mesh shader kind
     ms_old_container[36 + 8 + 2] = 13;
     const auto vs_container = shader_container(vs_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
+    const auto library =
+        std::filesystem::temp_directory_path() / ("leonida_mesh_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_old.spv", std::filesystem::copy_options::overwrite_existing);
@@ -217,6 +219,19 @@ int main(int argc, char** argv) {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
+        // Slot 86 on a console-numbered mesh stream must also refuse with E_NOTIMPL without VK_EXT_mesh_shader
+        // (including under LEONIDA_PIPELINE_COMPILE=on-demand).
+        {
+            Stream console_stream;
+            console_stream.add(RootSubobject{.inner = root.p});
+            console_stream.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+            console_stream.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+            using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+            const auto console_desc = console_stream.desc();
+            EXPECT(reinterpret_cast<Create>(slot(device.p, 86))(device.p, &console_desc, IID_PPV_ARGS(&pso.p)) ==
+                       E_NOTIMPL &&
+                   !pso.p);
+        }
         // A DISPATCH_MESH command signature is refused the same way.
         const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
         const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
@@ -259,6 +274,11 @@ int main(int argc, char** argv) {
             old_stream.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms_old}).add(PsSubobject{.inner = ps});
             old_stream.add(TargetsSubobject{.inner = one_target()});
             EXPECT(create(device.p, old_stream, refused) == E_INVALIDARG && !refused.p);
+            using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+            const auto old_desc = old_stream.desc();
+            EXPECT(reinterpret_cast<Create>(slot(device.p, 86))(device.p, &old_desc, IID_PPV_ARGS(&refused.p)) ==
+                       E_INVALIDARG &&
+                   !refused.p);
         }
 
         // Streams the PC runtime refuses.
@@ -360,6 +380,12 @@ int main(int argc, char** argv) {
                .add(AsSubobject{.inner = {as_container.data(), as_container.size()}})
                .add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
         EXPECT(FAILED(create(device.p, as_only, refused)) && !refused.p);
+        {
+            using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+            const auto as_desc = as_only.desc();
+            EXPECT(FAILED(reinterpret_cast<Create>(slot(device.p, 86))(device.p, &as_desc, IID_PPV_ARGS(&refused.p))) &&
+                   !refused.p);
+        }
         // An MS and an AS in PC numbering stay the PC's (and refused, the layer builds no AS).
         bad = mesh_stream;
         bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
