@@ -609,7 +609,8 @@ class HarnessErrors(unittest.TestCase):
         with tempfile.TemporaryDirectory() as build:
             exe = os.path.join(build, "vk_compute_test.exe")   # only has to exist: run_gpu is replaced
             open(exe, "wb").close()
-            with mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
+            with mock.patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": ""}), \
+                    mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
                     mock.patch.object(X, "translate", side_effect=translate), \
                     mock.patch.object(X, "run_gpu", side_effect=run_gpu), \
                     mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", exe] + argv), \
@@ -943,6 +944,165 @@ class Ext(unittest.TestCase):
             labels = [ln for ln in plain if ln.endswith(":")]
             self.assertEqual(len(guarded), 2 * (len(plain) - len(labels)) - 1 + len(labels))
         self.assertGreater(loops, 10)
+
+
+class PcTailUbo(unittest.TestCase):
+    """--pc-tail-ubo and LEONIDA_PC_TAIL_UBO forward the 128-byte push-constant layout to both translator and harness."""
+
+    def test_translate_forwards_pc_tail_ubo(self):
+        cmds = []
+
+        def fake_run(cmd, **_kw):
+            cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", side_effect=fake_run):
+            X.translate(work, False)
+            X.translate(work, False, pc_tail=True)
+            X.translate(work, True, pc_tail=True)
+        self.assertNotIn("--pc-tail-ubo", cmds[0])
+        self.assertIn("--pc-tail-ubo", cmds[1])
+        self.assertNotIn("--wave64-emulate", cmds[1])
+        self.assertIn("--pc-tail-ubo", cmds[2])
+        self.assertIn("--wave64-emulate", cmds[2])
+
+    def test_gpu_env_and_run_gpu_set_pc_tail_env(self):
+        prog = X.make_program(1, 32, 4)
+        self.assertNotIn("LEONIDA_PC_TAIL_UBO", X.gpu_env(prog, False, "d.bin", base={}))
+        self.assertEqual(X.gpu_env(prog, False, "d.bin", base={}, pc_tail=True)["LEONIDA_PC_TAIL_UBO"], "1")
+        self.assertEqual(
+            X.gpu_env(prog, False, "d.bin", base={"LEONIDA_PC_TAIL_UBO": "0"}, pc_tail=True)["LEONIDA_PC_TAIL_UBO"],
+            "1",
+        )
+
+        seen_envs = []
+
+        def fake_run(cmd, **kw):
+            seen_envs.append(kw["env"])
+            with open(kw["env"]["VKC_DUMP"], "wb") as f:
+                f.write(b"\x00" * (4 * prog.group * len(X.OUT_REGS)))
+            return subprocess.CompletedProcess(cmd, 0, "compute subgroup size: 32\n", "")
+
+        with tempfile.TemporaryDirectory() as work, \
+                mock.patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": ""}), \
+                mock.patch.object(X.subprocess, "run", side_effect=fake_run):
+            os.environ.pop("LEONIDA_PC_TAIL_UBO", None)
+            X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+            X.run_gpu("vk_compute_test", "p.spv", prog, work, False, pc_tail=True)
+        self.assertNotIn("LEONIDA_PC_TAIL_UBO", seen_envs[0])
+        self.assertEqual(seen_envs[1]["LEONIDA_PC_TAIL_UBO"], "1")
+
+    def test_main_enables_pc_tail_ubo_from_flag_or_env(self):
+        cases = (
+            ([], "", False),
+            (["--pc-tail-ubo"], "", True),
+            ([], "1", True),
+            ([], "true", True),
+            ([], " YES ", True),
+            ([], "on", True),
+            ([], "0", False),
+            (["--pc-tail-ubo"], "0", True),
+        )
+        for extra, env_val, want in cases:
+            with self.subTest(extra=extra, env_val=env_val):
+                names, seen_t, seen_g = [], [], []
+
+                def fake_translate(work, emulate, pc_tail=False):
+                    seen_t.append(pc_tail)
+                    spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
+                    os.makedirs(spdir, exist_ok=True)
+                    for name in names:
+                        open(os.path.join(spdir, name + ".spv"), "wb").close()
+                    return spdir, ""
+
+                def fake_run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
+                    seen_g.append(pc_tail)
+                    return HarnessErrors._expected_words(prog)
+
+                out = io.StringIO()
+                with tempfile.TemporaryDirectory() as build:
+                    exe = os.path.join(build, "vk_compute_test.exe")
+                    open(exe, "wb").close()
+                    with mock.patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": env_val}), \
+                            mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
+                            mock.patch.object(X, "translate", side_effect=fake_translate), \
+                            mock.patch.object(X, "run_gpu", side_effect=fake_run_gpu), \
+                            mock.patch.object(X.mc_command, "mc_command", return_value=["llvm-mc"]), \
+                            mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", exe,
+                                                            "--programs", "1", "--wave", "32",
+                                                            "--modes", "native", "--no-maskdata"] + extra), \
+                            contextlib.redirect_stdout(out):
+                        code = X.main()
+                self.assertEqual(code, 0, out.getvalue())
+                self.assertEqual(seen_t, [want])
+                self.assertEqual(seen_g, [want])
+
+    def test_minimize_and_still_fails_forward_pc_tail_ubo(self):
+        prog = X.make_program(1, 32, 2, allow_maskdata=False)
+        for ctx, want in (((["llvm-mc"], "vk_compute_test"), False),
+                          ((["llvm-mc"], "vk_compute_test", True), True)):
+            with self.subTest(want=want):
+                seen_t, seen_g = [], []
+
+                def fake_translate(work, emulate, pc_tail=False):
+                    seen_t.append(pc_tail)
+                    spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
+                    os.makedirs(spdir, exist_ok=True)
+                    open(os.path.join(spdir, prog.name + ".spv"), "wb").close()
+                    return spdir, ""
+
+                def fake_run_gpu(exe, spv, p, work, emulate, pc_tail=False):
+                    seen_g.append(pc_tail)
+                    words = HarnessErrors._expected_words(p)
+                    words[0] ^= 1
+                    return words
+
+                with mock.patch.object(X, "assemble"), \
+                        mock.patch.object(X, "translate", side_effect=fake_translate), \
+                        mock.patch.object(X, "run_gpu", side_effect=fake_run_gpu):
+                    self.assertTrue(X.still_fails(prog, prog.ops, "native", ctx))
+                self.assertEqual(seen_t, [want])
+                self.assertEqual(seen_g, [want])
+
+        # Also verify main() threads --pc-tail-ubo into minimize() on a mismatch.
+        names, min_ctxs = [], []
+
+        def fake_translate(work, emulate, pc_tail=False):
+            spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
+            os.makedirs(spdir, exist_ok=True)
+            for name in names:
+                open(os.path.join(spdir, name + ".spv"), "wb").close()
+            return spdir, ""
+
+        def fake_run_gpu(exe, spv, p, work, emulate, pc_tail=False):
+            words = HarnessErrors._expected_words(p)
+            words[0] ^= 1
+            return words
+
+        def fake_minimize(p, mode, ctx):
+            min_ctxs.append(ctx)
+            return p.ops
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as build:
+            exe = os.path.join(build, "vk_compute_test.exe")
+            open(exe, "wb").close()
+            with mock.patch.dict(os.environ, {"LEONIDA_PC_TAIL_UBO": ""}), \
+                    mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
+                    mock.patch.object(X, "translate", side_effect=fake_translate), \
+                    mock.patch.object(X, "run_gpu", side_effect=fake_run_gpu), \
+                    mock.patch.object(X, "minimize", side_effect=fake_minimize), \
+                    mock.patch.object(X.mc_command, "mc_command", return_value=["llvm-mc"]), \
+                    mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", exe,
+                                                    "--programs", "1", "--wave", "32", "--ops", "2",
+                                                    "--modes", "native", "--no-maskdata",
+                                                    "--pc-tail-ubo", "--minimize"]), \
+                    contextlib.redirect_stdout(out):
+                code = X.main()
+        self.assertEqual(code, 1)
+        self.assertEqual(len(min_ctxs), 1)
+        self.assertEqual(len(min_ctxs[0]), 3)
+        self.assertTrue(min_ctxs[0][2])
 
 
 if __name__ == "__main__":
