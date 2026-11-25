@@ -663,55 +663,55 @@ class B32MaskBarrierTests(unittest.TestCase):
                 ("v_cmp_ge_u32_e64 vcc, v0, 36", 8),
                 ("s_mov_b32 vcc_lo, vcc_hi", 4),
                 ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
-            ], lambda l: 20 if (l < 16 and (l + 32) >= 36) else (10 if l < 16 else 0)),
+            ], lambda l: (20 if (l + 32) >= 36 else 10) if l < 16 else (20 if l >= 36 else 0)),
             ("s_and_b32_vcc_opp_dead_scc", [
                 ("v_cmp_ge_u32_e64 vcc, v0, 38", 8),
                 ("s_and_b32 vcc_lo, vcc_hi, -1", 4),
                 ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
-            ], lambda l: 20 if (l < 16 and (l + 32) >= 38) else (10 if l < 16 else 0)),
+            ], lambda l: (20 if (l + 32) >= 38 else 10) if l < 16 else ((20 if l >= 38 else 10) if l >= 36 else 0)),
             ("s_not_b32_vcc_opp_dead_scc", [
                 ("v_cmp_ge_u32_e64 vcc, v0, 38", 8),
                 ("s_not_b32 vcc_lo, vcc_hi", 4),
                 ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
-            ], lambda l: 20 if (l < 16 and not ((l + 32) >= 38)) else (10 if l < 16 else 0)),
+            ], lambda l: (20 if not ((l + 32) >= 38) else 10) if l < 16 else ((20 if l >= 38 else 10) if l >= 36 else 0)),
             ("s_cselect_b32_vcc_opp", [
                 ("s_cmp_eq_u32 1, 1", 4),
                 ("v_cmp_ge_u32_e64 vcc, v0, 37", 8),
                 ("s_cselect_b32 vcc_lo, vcc_hi, 0", 4),
                 ("v_cndmask_b32_e64 v4, 10, 20, vcc", 8),
-            ], lambda l: 20 if (l < 16 and (l + 32) >= 37) else (10 if l < 16 else 0)),
+            ], lambda l: (20 if (l + 32) >= 37 else 10) if l < 16 else ((20 if l >= 37 else 10) if l >= 36 else 0)),
             ("s_and_b32_vcc_same_live_scc", [
                 ("v_cmp_eq_u32_e64 vcc, v0, 5", 8),
                 ("s_and_b32 vcc_lo, vcc_lo, -1", 4),
                 ("s_cselect_b32 s14, 77, 88", 4),
                 ("v_mov_b32_e32 v4, s14", 4),
-            ], lambda l: 77 if l < 16 else 0),
+            ], lambda l: 77 if (l < 16 or l >= 36) else 0),
             ("s_and_b32_sgpr_live_scc", [
                 ("v_cmp_eq_u32_e64 vcc, v0, 5", 8),
                 ("s_and_b32 s15, vcc_lo, -1", 4),
                 ("s_cselect_b32 s14, 91, 92", 4),
                 ("v_mov_b32_e32 v4, s14", 4),
-            ], lambda l: 91 if l < 16 else 0),
+            ], lambda l: 91 if (l < 16 or l >= 36) else 0),
             ("s_and_saveexec_b32_hi_src", [
                 ("v_cmp_ge_u32_e64 vcc, v0, 36", 8),
                 ("s_and_saveexec_b32 s14, vcc_hi", 4),
                 ("v_mov_b32_e32 v4, 33", 4),
-            ], lambda l: 33 if (l < 16 and (l + 32) >= 36) else 0),
+            ], lambda l: 33 if ((l < 16 and (l + 32) >= 36) or l >= 36) else 0),
             ("s_andn1_wrexec_b32_hi_src", [
                 ("v_cmp_ge_u32_e64 vcc, v0, 36", 8),
                 ("s_andn1_wrexec_b32 s14, vcc_hi", 4),
                 ("v_mov_b32_e32 v4, 44", 4),
-            ], lambda l: 44 if (l < 16 and not ((l + 32) >= 36)) else 0),
+            ], lambda l: 44 if ((l < 16 and not ((l + 32) >= 36)) or l >= 36) else 0),
             ("s_and_saveexec_b32_vcc_hi_dst", [
                 ("v_cmp_lt_u32_e64 s[6:7], v0, 8", 8),
                 ("s_and_saveexec_b32 vcc_hi, s6", 4),
                 ("v_mov_b32_e32 v4, 55", 4),
-            ], lambda l: 55 if l < 8 else 0),
+            ], lambda l: 55 if (l < 8 or l >= 36) else 0),
         ]
         for name, body, expect in cases:
             with self.subTest(case=name):
                 skip_words = sum(nb for _, nb in body) // 4
-                # Lanes 0..15 and 36..47 active so vcc_hi has non-zero bits while vcc_lo observes them.
+                # Lanes 0..15 and 36..63 active so vcc_hi has non-zero bits while vcc_lo observes them.
                 insns = [
                     ("v_mov_b32_e32 v4, 0", 4),
                     ("v_cmp_lt_u32_e64 s[4:5], v0, 16", 8),
@@ -730,7 +730,7 @@ class B32MaskBarrierTests(unittest.TestCase):
                 self.assertGreaterEqual(_pre_vote_or_atomic_count(spv), 1)
                 for rev in (False, True):
                     mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
-                    for lane in range(16):
+                    for lane in range(64):
                         self.assertEqual(mem[lane * 4], expect(lane), f"{name} lane {lane} rev={rev}")
 
     def test_same_half_b32_dead_scc_still_folds(self):
