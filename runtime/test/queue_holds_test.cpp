@@ -161,7 +161,8 @@ int test_exception_safety_does_not_wedge_thread() {
     holds.pump_ready();  // must run on the exact same thread and drain the second held op
     EXPECT(ran == 1 && !holds.any_held());
 
-    // 2. Exception from a Barrier callback must not leave in_pump() or pump_active_ stuck.
+    // 2. Exception from a Barrier callback must drain sibling ready barriers, rethrow the first error, and not leave
+    // in_pump() or pump_active_ stuck.
     const int owner = 0;
     int barrier_ran = 0;
     holder.hold(kFence2, 1, [&] { ++ran; });
@@ -175,9 +176,10 @@ int test_exception_safety_does_not_wedge_thread() {
         caught = true;
     }
     EXPECT(caught);
-    EXPECT(ran == 2 && barrier_ran == 0);
-    holds.pump_ready();
-    EXPECT(barrier_ran == 1);
+    EXPECT(ran == 2 && barrier_ran == 1);
+    int later_barrier_ran = 0;
+    holds.after_held(&owner, [&] { ++later_barrier_ran; });
+    EXPECT(later_barrier_ran == 1);
 
     // 3. Exception from discard_waiting_on() in remove_fence() must not leave in_pump() stuck.
     bool should_throw = true;
@@ -212,6 +214,169 @@ int test_exception_safety_does_not_wedge_thread() {
     EXPECT(after_remove == 1 && !holds.any_held());
 
     holds.detach(&holder);
+    return 0;
+}
+
+int test_concurrent_handoff_preserved_on_throw() {
+    // 1. Thread A is inside holder_a->release_ready(); thread B registers an after_held callback and returns via
+    // pump_active_ (setting dirty_); thread A then throws. Both the exception and thread B's callback must complete
+    // without requiring a separate pump_ready() call.
+    {
+        Holds holds;
+        TestHolder holder_a(holds);
+        holds.attach(&holder_a);
+
+        constexpr std::uint64_t kFenceA = 70;
+        holds.add_fence(kFenceA, 0);
+
+        std::atomic<bool> entered{false}, release_throw{false};
+        holder_a.hold(kFenceA, 1, [&] {
+            entered.store(true, std::memory_order_release);
+            while (!release_throw.load(std::memory_order_acquire)) std::this_thread::yield();
+            throw std::runtime_error("holder handoff throw");
+        });
+        holds.signaled(kFenceA, 1);
+
+        std::atomic<bool> caught{false};
+        std::thread thread_a([&] {
+            try {
+                holds.pump_ready();
+            } catch (const std::runtime_error&) {
+                caught.store(true, std::memory_order_release);
+            }
+        });
+        while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        const int owner = 0;
+        std::atomic<int> cb_count{0};
+        holds.after_held(&owner, [&] { cb_count.fetch_add(1, std::memory_order_relaxed); });
+        EXPECT(cb_count.load() == 0);  // handed off to thread A via dirty_
+
+        release_throw.store(true, std::memory_order_release);
+        thread_a.join();
+
+        EXPECT(caught.load(std::memory_order_acquire));
+        EXPECT(cb_count.load() == 1);
+        holds.detach(&holder_a);
+    }
+
+    // 2. Thread A throws in holder_a->release_ready() after thread B concurrently signaled holder_b and handed off.
+    {
+        Holds holds;
+        TestHolder holder_a(holds), holder_b(holds);
+        holds.attach(&holder_a);
+        holds.attach(&holder_b);
+
+        constexpr std::uint64_t kFenceA = 71, kFenceB = 72;
+        holds.add_fence(kFenceA, 0);
+        holds.add_fence(kFenceB, 0);
+
+        std::atomic<bool> entered{false}, release_throw{false};
+        holder_a.hold(kFenceA, 1, [&] {
+            entered.store(true, std::memory_order_release);
+            while (!release_throw.load(std::memory_order_acquire)) std::this_thread::yield();
+            throw std::runtime_error("holder_a throw");
+        });
+        std::atomic<int> b_ran{0};
+        holder_b.hold(kFenceB, 1, [&] { b_ran.fetch_add(1, std::memory_order_relaxed); });
+        holds.signaled(kFenceA, 1);
+
+        std::atomic<bool> caught{false};
+        std::thread thread_a([&] {
+            try {
+                holds.pump_ready();
+            } catch (const std::runtime_error&) {
+                caught.store(true, std::memory_order_release);
+            }
+        });
+        while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        holds.signaled(kFenceB, 1);
+        holds.pump_ready();  // sets dirty_ and returns via pump_active_
+        EXPECT(b_ran.load() == 0);
+
+        release_throw.store(true, std::memory_order_release);
+        thread_a.join();
+
+        EXPECT(caught.load(std::memory_order_acquire));
+        EXPECT(b_ran.load() == 1);
+        EXPECT(!holds.any_held());
+        holds.detach(&holder_b);
+        holds.detach(&holder_a);
+    }
+
+    // 3. Thread A throws inside a barrier callback after thread B concurrently registers a second barrier.
+    {
+        Holds holds;
+        const int owner = 0;
+        std::atomic<bool> entered{false}, release_throw{false}, caught{false};
+        std::atomic<int> second_ran{0};
+
+        std::thread thread_a([&] {
+            try {
+                holds.after_held(&owner, [&] {
+                    entered.store(true, std::memory_order_release);
+                    while (!release_throw.load(std::memory_order_acquire)) std::this_thread::yield();
+                    throw std::runtime_error("barrier_1 throw");
+                });
+            } catch (const std::runtime_error&) {
+                caught.store(true, std::memory_order_release);
+            }
+        });
+        while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        holds.after_held(&owner, [&] { second_ran.fetch_add(1, std::memory_order_relaxed); });
+        EXPECT(second_ran.load() == 0);
+
+        release_throw.store(true, std::memory_order_release);
+        thread_a.join();
+
+        EXPECT(caught.load(std::memory_order_acquire));
+        EXPECT(second_ran.load() == 1);
+    }
+
+    // 4. A holder that re-entrantly calls pump_ready() and throws without popping must not spin forever, and must
+    // still drain sibling holders before rethrowing.
+    {
+        struct AlwaysThrowingHolder final : public Holds::Holder {
+            Holds& holds;
+            int calls = 0;
+            explicit AlwaysThrowingHolder(Holds& h) : holds(h) {}
+            bool release_ready() override {
+                ++calls;
+                holds.pump_ready();  // re-entrant: sets dirty_ = true
+                throw std::runtime_error("always throws");
+            }
+            void discard_waiting_on(std::uint64_t) override {}
+            std::uint64_t oldest_held_seq() override { return 0; }
+        };
+
+        Holds holds;
+        AlwaysThrowingHolder bad(holds);
+        TestHolder good(holds);
+        holds.attach(&bad);
+        holds.attach(&good);
+
+        constexpr std::uint64_t kFence = 73;
+        holds.add_fence(kFence, 0);
+        int good_ran = 0;
+        good.hold(kFence, 1, [&] { ++good_ran; });
+        holds.signaled(kFence, 1);
+
+        bool caught = false;
+        try {
+            holds.pump_ready();
+        } catch (const std::runtime_error&) {
+            caught = true;
+        }
+        EXPECT(caught);
+        EXPECT(bad.calls == 1);
+        EXPECT(good_ran == 1);
+        EXPECT(!holds.any_held());
+
+        holds.detach(&good);
+        holds.detach(&bad);
+    }
     return 0;
 }
 
@@ -367,6 +532,7 @@ int test_multithreaded_pump_handoff_no_lost_wakeups() {
 int main() {
     if (int r = test_wait_before_signal_chain_and_barriers()) return r;
     if (int r = test_exception_safety_does_not_wedge_thread()) return r;
+    if (int r = test_concurrent_handoff_preserved_on_throw()) return r;
     if (int r = test_nested_distinct_instances_are_independent()) return r;
     if (int r = test_detach_and_cancel_after_synchronize()) return r;
     if (int r = test_multithreaded_pump_handoff_no_lost_wakeups()) return r;

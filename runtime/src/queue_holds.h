@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -156,7 +158,9 @@ public:
 
     // Releases every held operation that has become ready, in dependency order: a release can submit a Signal
     // that makes another queue's front ready, so passes repeat until one finds nothing new. Then the callbacks
-    // whose held work is all gone.
+    // whose held work is all gone. If a holder or callback throws, the first exception is captured and rethrown
+    // only after any concurrent dirty_ handoff has been honoured (skipping holders that already threw in this
+    // pump so a failing holder cannot spin), so work handed off by another thread is never left stranded.
     void pump_ready() {
         if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) return;
         {
@@ -174,25 +178,39 @@ public:
                 self->pump_active_ = false;
             }
         } active_guard{this};
-        std::lock_guard pump(pump_mutex_);
-        PumpScope scope(this);
-        for (;;) {
-            {
-                std::lock_guard lock(mutex_);
-                if (!dirty_) {
-                    pump_active_ = false;
-                    active_guard.active = false;
-                    return;
+        std::exception_ptr first_error;
+        {
+            std::lock_guard pump(pump_mutex_);
+            PumpScope scope(this);
+            std::vector<Holder*> failed_holders;
+            for (;;) {
+                {
+                    std::lock_guard lock(mutex_);
+                    if (!dirty_) {
+                        pump_active_ = false;
+                        active_guard.active = false;
+                        break;
+                    }
+                    dirty_ = false;
                 }
-                dirty_ = false;
+                bool progress = true;
+                while (progress) {
+                    progress = false;
+                    for (Holder* holder : snapshot()) {
+                        if (std::find(failed_holders.begin(), failed_holders.end(), holder) != failed_holders.end())
+                            continue;
+                        try {
+                            progress |= holder->release_ready();
+                        } catch (...) {
+                            if (!first_error) first_error = std::current_exception();
+                            failed_holders.push_back(holder);
+                        }
+                    }
+                }
+                run_barriers(first_error);
             }
-            bool progress = true;
-            while (progress) {
-                progress = false;
-                for (Holder* holder : snapshot()) progress |= holder->release_ready();
-            }
-            run_barriers();
         }
+        if (first_error) std::rethrow_exception(first_error);
     }
 
 private:
@@ -232,7 +250,7 @@ private:
     }
 
     // Called with pump_mutex_ held. A callback runs when no held operation is older than the moment it was asked.
-    void run_barriers() {
+    void run_barriers(std::exception_ptr& first_error) {
         for (;;) {
             Barrier front;
             {
@@ -241,8 +259,13 @@ private:
                 front = barriers_.front();
             }
             for (Holder* holder : snapshot()) {
-                const std::uint64_t oldest = holder->oldest_held_seq();
-                if (oldest && oldest <= front.seq) return;
+                try {
+                    const std::uint64_t oldest = holder->oldest_held_seq();
+                    if (oldest && oldest <= front.seq) return;
+                } catch (...) {
+                    if (!first_error) first_error = std::current_exception();
+                    return;
+                }
             }
             {
                 std::lock_guard lock(mutex_);
@@ -251,7 +274,11 @@ private:
                 barriers_.pop_front();
                 barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
             }
-            front.fn();
+            try {
+                front.fn();
+            } catch (...) {
+                if (!first_error) first_error = std::current_exception();
+            }
         }
     }
 
