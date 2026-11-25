@@ -67,22 +67,25 @@ inline bool header_matches(const void* data, std::size_t size, const cached_pso:
            std::memcmp(bytes + 16, identity.cache_uuid, sizeof(identity.cache_uuid)) == 0;
 }
 
-inline constexpr std::uint64_t default_checkpoint_interval_ms = 120000;
+inline constexpr std::uint64_t default_checkpoint_interval_ms = 30000;
+inline constexpr std::uint64_t default_checkpoint_retry_ms = 5000;
+inline constexpr std::size_t checkpoint_priority = 1;  // behind priority-0 awaited builds, ahead of warm-up (SPIR-V bytes)
 
 enum class CheckpointOutcome : std::uint8_t {
     saved,     // snapshot written; wait interval_ms before the next checkpoint
-    deferred,  // skipped because a compile was active or queued; retry on the next compile completion
+    deferred,  // yielded to a priority-0 awaited build; retry after retry_ms
     skipped,   // empty cache, over size cap, or I/O failure; wait interval_ms before retrying
 };
 
 // Coalesces startup pipeline-cache checkpoint scheduling across compiling threads.
-// At most one checkpoint runs at a time; a deferred checkpoint stays eligible immediately instead of burning the
+// At most one checkpoint runs at a time; a deferred checkpoint backs off briefly (retry_ms) instead of burning the
 // full cooldown interval.
 class CheckpointSchedule {
 public:
     explicit CheckpointSchedule(std::uint64_t initial_due_ms,
-                                std::uint64_t interval_ms = default_checkpoint_interval_ms)
-        : next_due_ms_(clamp_due(initial_due_ms)), interval_ms_(interval_ms) {}
+                                std::uint64_t interval_ms = default_checkpoint_interval_ms,
+                                std::uint64_t retry_ms = default_checkpoint_retry_ms)
+        : next_due_ms_(clamp_due(initial_due_ms)), interval_ms_(interval_ms), retry_ms_(retry_ms) {}
 
     bool try_claim(std::uint64_t now_ms) {
         std::uint64_t expected = next_due_ms_.load(std::memory_order_acquire);
@@ -96,12 +99,13 @@ public:
     }
 
     void complete(std::uint64_t now_ms, CheckpointOutcome outcome) {
-        const std::uint64_t next =
-            outcome == CheckpointOutcome::deferred ? clamp_due(now_ms) : saturate_add(now_ms, interval_ms_);
-        next_due_ms_.store(next, std::memory_order_release);
+        const std::uint64_t wait = outcome == CheckpointOutcome::deferred ? retry_ms_ : interval_ms_;
+        next_due_ms_.store(saturate_add(now_ms, wait), std::memory_order_release);
     }
 
-    void abort_claim(std::uint64_t now_ms) { next_due_ms_.store(clamp_due(now_ms), std::memory_order_release); }
+    void abort_claim(std::uint64_t now_ms) {
+        next_due_ms_.store(saturate_add(now_ms, retry_ms_), std::memory_order_release);
+    }
 
     std::uint64_t next_due_ms() const { return next_due_ms_.load(std::memory_order_acquire); }
     bool in_progress() const { return next_due_ms_.load(std::memory_order_acquire) == in_flight; }
@@ -116,6 +120,7 @@ private:
 
     std::atomic<std::uint64_t> next_due_ms_;
     std::uint64_t interval_ms_;
+    std::uint64_t retry_ms_;
 };
 
 }  // namespace leonida::pipeline_cache_store

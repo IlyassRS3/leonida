@@ -91,46 +91,51 @@ static int test_checkpoint_schedule() {
     using store::CheckpointOutcome;
     using store::CheckpointSchedule;
 
-    CheckpointSchedule schedule(120000, 120000);
+    CHECK(store::default_checkpoint_interval_ms == 30000);
+    CHECK(store::default_checkpoint_retry_ms == 5000);
+    CHECK(store::checkpoint_priority == 1);
+
+    CheckpointSchedule schedule(30000);
     CHECK(!schedule.in_progress());
     CHECK(!schedule.try_claim(0));
-    CHECK(!schedule.try_claim(119999));
+    CHECK(!schedule.try_claim(29999));
 
     // At the due time, one caller claims the slot; concurrent callers see in_progress and are coalesced.
-    CHECK(schedule.try_claim(120000));
+    CHECK(schedule.try_claim(30000));
     CHECK(schedule.in_progress());
-    CHECK(!schedule.try_claim(120000));
-    CHECK(!schedule.try_claim(240000));
+    CHECK(!schedule.try_claim(30000));
+    CHECK(!schedule.try_claim(90000));
 
-    // A deferred checkpoint (active compile or waiter) must NOT burn the 120 s cooldown: it becomes immediately
-    // eligible on the next compile completion.
-    schedule.complete(120050, CheckpointOutcome::deferred);
+    // A deferred checkpoint (priority-0 awaited build queued) retries after retry_ms (5 s) rather than burning the
+    // full 30 s cooldown.
+    schedule.complete(30050, CheckpointOutcome::deferred);
     CHECK(!schedule.in_progress());
-    CHECK(schedule.next_due_ms() == 120050);
-    CHECK(!schedule.try_claim(120049));
-    CHECK(schedule.try_claim(120050));
+    CHECK(schedule.next_due_ms() == 35050);
+    CHECK(!schedule.try_claim(35049));
+    CHECK(schedule.try_claim(35050));
 
-    // Queue failure (abort_claim) also preserves immediate retry without burning the cooldown.
-    schedule.abort_claim(120060);
+    // Queue failure (abort_claim) also retries after retry_ms.
+    schedule.abort_claim(35060);
     CHECK(!schedule.in_progress());
-    CHECK(schedule.next_due_ms() == 120060);
-    CHECK(schedule.try_claim(120060));
+    CHECK(schedule.next_due_ms() == 40060);
+    CHECK(!schedule.try_claim(40059));
+    CHECK(schedule.try_claim(40060));
 
-    // A saved snapshot advances the deadline by interval_ms.
-    schedule.complete(125000, CheckpointOutcome::saved);
+    // A saved snapshot advances the deadline by interval_ms (30 s).
+    schedule.complete(41000, CheckpointOutcome::saved);
     CHECK(!schedule.in_progress());
-    CHECK(schedule.next_due_ms() == 245000);
-    CHECK(!schedule.try_claim(244999));
-    CHECK(schedule.try_claim(245000));
+    CHECK(schedule.next_due_ms() == 71000);
+    CHECK(!schedule.try_claim(70999));
+    CHECK(schedule.try_claim(71000));
 
     // A skipped snapshot (empty cache, over limit, or I/O error) backs off by interval_ms so disk is not hammered.
-    schedule.complete(245010, CheckpointOutcome::skipped);
-    CHECK(schedule.next_due_ms() == 365010);
-    CHECK(!schedule.try_claim(365009));
+    schedule.complete(71010, CheckpointOutcome::skipped);
+    CHECK(schedule.next_due_ms() == 101010);
+    CHECK(!schedule.try_claim(101009));
 
     // Near-UINT64_MAX timestamps saturate below the in_flight sentinel rather than wrapping or sticking in_flight.
     const std::uint64_t near_max = (std::numeric_limits<std::uint64_t>::max)() - 10;
-    CheckpointSchedule hi(near_max, 120000);
+    CheckpointSchedule hi(near_max);
     CHECK(hi.try_claim(near_max));
     hi.complete(near_max, CheckpointOutcome::saved);
     CHECK(!hi.in_progress());
