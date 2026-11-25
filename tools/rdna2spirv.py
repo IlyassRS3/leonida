@@ -10451,13 +10451,10 @@ class Gen:
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
             d = a[0] if len(a) == 1 else None
-            if d is not None and d["k"] == "sgpr" and d.get("n") == 2:
+            if d is not None and d["k"] == "sgpr" and d.get("n") == 2 and d["r"] % 2 == 0 and 0 <= d["r"] <= 104:
                 slots = (d["r"], d["r"] + 1)
             elif d is not None and d["k"] == "special" and d.get("t") == "vcc":
                 slots = ("vcc_lo", "vcc_hi")
-            elif (d is not None and d["k"] == "slist" and len(d["r"]) == 2
-                  and all(isinstance(r, int) or r in ("vcc_lo", "vcc_hi") for r in d["r"])):
-                slots = tuple(d["r"])
             elif d is not None and d["k"] == "special" and d.get("t") == "null":
                 slots = None
             else:
@@ -16896,13 +16893,10 @@ def halves_analysis(g, blocks, succ):
 
 
 def _far_branch_pair(a):
-    if a["k"] == "sgpr" and a.get("n") == 2:
+    if a["k"] == "sgpr" and a.get("n") == 2 and a["r"] % 2 == 0 and 0 <= a["r"] <= 104:
         return (a["r"], a["r"] + 1)
     if a["k"] == "special" and a.get("t") == "vcc":
         return ("vcc_lo", "vcc_hi")
-    if (a["k"] == "slist" and len(a["r"]) == 2
-            and all(isinstance(r, int) or r in ("vcc_lo", "vcc_hi") for r in a["r"])):
-        return tuple(a["r"])
     return None
 
 
@@ -16915,8 +16909,8 @@ def _far_branch_slot(a):
 
 
 def fold_far_branches(insns):
-    """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] (or the same
-    sequence using `vcc` or a 2-slot `slist`) is a far branch (s_branch only reaches +-32K dwords): the target is
+    """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] (for an
+    even-aligned SGPR pair `s[a:a+1]` or `vcc`) is a far branch (s_branch only reaches +-32K dwords): the target is
     the address after s_getpc plus K. Fold the four instructions into one s_branch with an explicit byte target so
     the CFG sees an ordinary branch."""
     out, i = [], 0

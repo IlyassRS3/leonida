@@ -1,23 +1,28 @@
-"""Semantic tests for `s_getpc_b64` destinations (`vcc`, 2-slot `slist`, `null`) and downstream uses.
+"""Semantic tests for `s_getpc_b64` destinations (`vcc`, `null`, even SGPR pairs) and downstream uses.
 
 RDNA2 ISA SOP1 `s_getpc_b64` (opcode 0x1f) writes the 64-bit address of the next instruction into a 64-bit
-scalar destination (`SDST`, LLVM `SReg_64`):
-  - `s[a:a+1]` (2-SGPR pair, 0..104)
+scalar destination (`SDST`, LLVM `SReg_64`; AMD RDNA 2 ISA §§3.2 and 3.6.3):
+  - `s[a:a+1]` (even-aligned 2-SGPR pair, 0..104)
   - `vcc` (`s[106:107]`, `{vcc_lo, vcc_hi}` -> `%vcc` / `%vcc_hi`)
-  - `[s105,vcc_lo]` (2-slot `slist` straddling `s105` and `vcc_lo`, `sdst=105`)
   - `null` (`sdst=125`, result discarded, no `uses_codebase`, still requires `; encoding:` bytes)
 
+Odd-aligned register pairs (`s[1:2]`, `[s105,vcc_lo]` from raw SDST 105) remain unsupported in lowering and
+far-branch folding so the LLVM and Python disassembler paths agree in refusing them.
+
 Covers:
-  - 64-bit code-base + next-PC addition (including 32-bit carry into the high word) into `vcc`, `[s105,vcc_lo]`,
-    and `null` across wave32, wave64, and `--wave64-emulate`
-  - `s_getpc_b64 vcc` / `[s105,vcc_lo]` feeding `s_add_u32` + `s_addc_u32` + `s_load_dword` and `global_load_dword`
+  - 64-bit code-base + next-PC addition (including 32-bit carry into the high word) into `vcc` and `null`
+    across wave32, wave64, and `--wave64-emulate`
+  - `s_getpc_b64 vcc` feeding `s_add_u32` + `s_addc_u32` + `s_load_dword` and `global_load_dword`
   - Prior wave32 `vcc_hi` and wave64 `vcc` lane masks cleared so subsequent loads read raw PC words
-  - `s_getpc_b64 vcc` feeding `s_mov_b64 s[a:b], vcc` (directly and after `s_add_u32`/`s_addc_u32` half updates)
-    via `wave64_emulate_opt.mark_vcc_data_moves`
-  - Far branches (`fold_far_branches`) using `vcc` and `[s105,vcc_lo]` (forward `add`/`addc` and backward `sub`/`subb`)
+  - `s_getpc_b64 vcc` feeding `s_mov_b64 s[a:b], vcc` (directly and after `s_add_u32`/`s_addc_u32` or
+    `s_sub_u32`/`s_subb_u32` half updates) via `wave64_emulate_opt.mark_vcc_data_moves`
+  - Far branches (`fold_far_branches`) using `vcc` (forward `add`/`addc` and backward `sub`/`subb`) and
+    refusal to fold odd pairs (`s[1:2]`, `[s105,vcc_lo]`)
+  - Raw-byte regressions covering both disassemblers (`tools/rdna2_decode.py` and the LLVM path +
+    `check_printed_encodings`) for aligned control SDST 104, `vcc` (106), `null` (125), and odd SDST 105 / 1
   - Wave32 FSSM header and sidecar-less wave-size inference (`s_getpc_b64 vcc` is not a wave64 marker)
-  - Rejection of unsupported destinations (`exec`, `m0`, `vcc_lo`, `vcc_hi`, `ttmp[0:1]`, `s4`, `s[4:7]`, `v[0:1]`)
-    and missing `; encoding:` bytes
+  - Rejection of unsupported destinations (`exec`, `m0`, `vcc_lo`, `vcc_hi`, `ttmp[0:1]`, `s4`, `s[4:7]`,
+    `s[1:2]`, `s[105:106]`, `[s105,vcc_lo]`, `v[0:1]`) and missing `; encoding:` bytes
 """
 import gc
 import json
@@ -41,6 +46,8 @@ for p in (HERE, TOOLS_DIR):
 
 import rdna2_decode  # noqa: E402
 import rdna2spirv  # noqa: E402
+import shader_disasm  # noqa: E402
+import shader_ir  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 import support  # noqa: E402
 
@@ -358,47 +365,190 @@ class GetPcDestinationTests(unittest.TestCase):
         finally:
             rdna2spirv.PC_TAIL_UBO = prev_ubo
 
-    def test_slist_destination_writes_s105_and_vcc_lo_preserving_vcc_hi(self):
-        # sdst=105 decodes to [s105, vcc_lo]; vcc_hi must stay untouched.
-        dec = rdna2_decode.decode_bytes(struct.pack("<I", 0xBEE91F00))["insns"]
-        self.assertEqual(len(dec), 1)
-        self.assertEqual(dec[0]["op"], "s_getpc_b64")
-        self.assertEqual(dec[0]["args"], [{"k": "slist", "r": [105, "vcc_lo"], "n": 2}])
+    def test_odd_register_pairs_rejected_in_lowering_and_far_branch(self):
+        # AMD RDNA 2 ISA §§3.2 and 3.6.3 require even-aligned 64-bit SGPR pairs for PC transfers.
+        # Keep odd pairs (s[1:2], s[105:106], and rdna2_decode's [s105,vcc_lo] for SDST 105) unsupported.
+        for bad_dst, enc in (
+            ("[s105,vcc_lo]", "; encoding: [0x00,0x1f,0xe9,0xbe]"),
+            ("s[1:2]", "; encoding: [0x00,0x1f,0x81,0xbe]"),
+            ("s[105:106]", "; encoding: [0x00,0x1f,0xe9,0xbe]"),
+        ):
+            for wave_size in (32, 64):
+                with self.subTest(bad_dst=bad_dst, wave_size=wave_size):
+                    lines = [
+                        f"s_getpc_b64 {bad_dst} {enc}",
+                        f"v_mov_b32_e32 v4, 0 {_enc(4)}",
+                        f"exp mrt0 v4, v4, v4, v4 done vm {_enc(8)}",
+                        f"s_endpgm {_enc(4)}",
+                    ]
+                    with self.assertRaisesRegex(rdna2spirv.Unsupported, "s_getpc_b64 destination"):
+                        _translate_ps("getpc_odd_dst", lines, wave_size=wave_size)
 
-        code_base = 0x00000009_FFFFFFFC
-        expected = code_base + 8  # s_mov_b32 vcc_hi (4B at pc=0) + s_getpc_b64 (4B at pc=4) -> nxt=8
-        lines = [
-            f"s_mov_b32 vcc_hi, 0x13572468 {_enc(4)}",
-            f"s_getpc_b64 [s105,vcc_lo] ; encoding: [0x00,0x1f,0xe9,0xbe]",
-            f"v_mov_b32_e32 v4, s105 {_enc(4)}",
-            f"v_mov_b32_e32 v5, vcc_lo {_enc(4)}",
-            f"v_mov_b32_e32 v6, vcc_hi {_enc(4)}",
-            f"v_mov_b32_e32 v7, 0 {_enc(4)}",
-            f"exp mrt0 v4, v5, v6, v7 done vm {_enc(8)}",
-            f"s_endpgm {_enc(4)}",
-        ]
-        spv, gen = _translate_ps("getpc_slist_105", lines, wave_size=32)
-        self.assertFalse(gen.wave64)
-        self.assertTrue(gen.uses_codebase)
-        words = support.mrt0_words(spv, push_constants=_pc_with_codebase(code_base))
-        self.assertEqual(words[:3], [expected & M32, (expected >> 32) & M32, 0x13572468])
+        # fold_far_branches must also refuse odd pairs rather than folding them into s_branch.
+        odd_far_cases = (
+            ("slist_105", [
+                f"s_getpc_b64 [s105,vcc_lo] ; encoding: [0x00,0x1f,0xe9,0xbe]",
+                f"s_add_u32 s105, s105, 20 {_enc(8)}",
+                f"s_addc_u32 vcc_lo, vcc_lo, 0 {_enc(4)}",
+                f"s_setpc_b64 [s105,vcc_lo] {_enc(4)}",
+            ]),
+            ("sgpr_1_2", [
+                f"s_getpc_b64 s[1:2] ; encoding: [0x00,0x1f,0x81,0xbe]",
+                f"s_add_u32 s1, s1, 20 {_enc(8)}",
+                f"s_addc_u32 s2, s2, 0 {_enc(4)}",
+                f"s_setpc_b64 s[1:2] {_enc(4)}",
+            ]),
+        )
+        for label, seq in odd_far_cases:
+            with self.subTest(odd_far=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    p = os.path.join(tmp, f"ps_far_{label}.s")
+                    with open(p, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(f"; ps_far_{label}\n")
+                        for ln in seq:
+                            f.write(f"\t{ln}\n")
+                    parsed = shader_ir.parse_file(p)["insns"]
+                folded = rdna2spirv.fold_far_branches(parsed)
+                self.assertEqual([ins["op"] for ins in folded],
+                                 ["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"])
+                full = [f"s_mov_b32 s10, 7 {_enc(4)}", *seq, f"s_mov_b32 s10, 99 {_enc(4)}",
+                        f"v_mov_b32_e32 v4, s10 {_enc(4)}", f"exp mrt0 v4, v4, v4, v4 done vm {_enc(8)}",
+                        f"s_endpgm {_enc(4)}"]
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, "s_getpc_b64 destination"):
+                    _translate_ps(f"far_{label}", full, wave_size=32)
 
-        # Also check [s105,vcc_lo] feeding s_load_dword.
-        table_base = 0x00000002_00008000
-        sload_lines = [
-            f"s_getpc_b64 [s105,vcc_lo] ; encoding: [0x00,0x1f,0xe9,0xbe]",
-            f"s_add_u32 s105, s105, 0x80 {_enc(8)}",
-            f"s_addc_u32 vcc_lo, vcc_lo, 0 {_enc(4)}",
-            f"s_load_dword s10, [s105,vcc_lo], 0x4 {_enc(8)}",
-            f"s_waitcnt lgkmcnt(0) {_enc(4)}",
-            f"v_mov_b32_e32 v4, s10 {_enc(4)}",
-            f"exp mrt0 v4, v4, v4, v4 done vm {_enc(8)}",
-            f"s_endpgm {_enc(4)}",
-        ]
-        spv2, _ = _translate_ps("getpc_slist_sload", sload_lines, wave_size=32)
-        got = support.mrt0_words(spv2, push_constants=_pc_with_codebase(table_base),
-                                 memory={table_base + 4 + 0x80 + 0x4: 0xFEEDFACE})
-        self.assertEqual(got, [0xFEEDFACE] * 4)
+    def test_raw_bytes_across_both_disassemblers(self):
+        # Raw-byte regression covering both project disassemblers (tools/rdna2_decode.py and the LLVM path +
+        # check_printed_encodings) on the same input bytes:
+        #   - s104=17, s105=29, vcc_lo=37, vcc_hi=47, then one s_getpc_b64 at byte offset 16 (next PC = code_start + 20)
+        #   - Aligned control SDST 104 (s[104:105]), vcc (106), and null (125) agree across both disassemblers
+        #     in wave32, wave64, and emulated wave64.
+        #   - Odd SDST 105 (00 1f e9 be) and SDST 1 (00 1f 81 be) are refused on BOTH disassemblers:
+        #     Python decoder prints [s105,vcc_lo] / s[1:2] -> Unsupported("s_getpc_b64 destination");
+        #     LLVM normalizes to s[104:105] / s[0:1] -> check_printed_encodings refuses the mismatched encoding.
+        def sop1(opc, sdst, ssrc0):
+            return struct.pack("<I", (0x17D << 23) | (sdst << 16) | (opc << 8) | ssrc0)
+
+        def vmov_e32(vdst, src0):
+            return struct.pack("<I", (0x3F << 25) | (vdst << 17) | (1 << 9) | src0)
+
+        def raw_program(sdst):
+            return b"".join([
+                sop1(0x03, 104, 128 + 17),                  # pc+0:  s_mov_b32 s104, 17
+                sop1(0x03, 105, 128 + 29),                  # pc+4:  s_mov_b32 s105, 29
+                sop1(0x03, 106, 128 + 37),                  # pc+8:  s_mov_b32 vcc_lo, 37
+                sop1(0x03, 107, 128 + 47),                  # pc+12: s_mov_b32 vcc_hi, 47
+                sop1(0x1F, sdst, 0),                        # pc+16: s_getpc_b64 <sdst> -> nxt = code_start + 20
+                vmov_e32(4, 104),                           # pc+20: v_mov_b32_e32 v4, s104
+                vmov_e32(5, 105),                           # pc+24: v_mov_b32_e32 v5, s105
+                vmov_e32(6, 106),                           # pc+28: v_mov_b32_e32 v6, vcc_lo
+                vmov_e32(7, 107),                           # pc+32: v_mov_b32_e32 v7, vcc_hi
+                bytes.fromhex("84 00 10 34"),               # pc+36: v_lshlrev_b32_e32 v8, 4, v0
+                bytes.fromhex("00 10 78 e0 08 04 00 80"),   # pc+40: buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
+                bytes.fromhex("00 00 81 bf"),               # pc+48: s_endpgm
+            ])
+
+        code_start = 0x148
+        nxt = code_start + 20  # 0x15c with code_base == 0
+
+        def translate_raw(tag, code, listing_text, wave_size, emulate=False):
+            prev_emu = rdna2spirv.WAVE64_EMULATE
+            try:
+                rdna2spirv.WAVE64_EMULATE = emulate
+                name = f"cs_raw_{tag}"
+                fssm_blob = _fssm(wave_size, cs=True) + code
+                with tempfile.TemporaryDirectory() as tmp:
+                    os.mkdir(os.path.join(tmp, "disasm"))
+                    os.mkdir(os.path.join(tmp, "fssm"))
+                    s_path = os.path.join(tmp, "disasm", name + ".s")
+                    hdr = f"; {name}  code 0x{code_start:x}..0x{code_start + len(code):x} (header), gfx1013, 0 invalid words\n"
+                    with open(s_path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(hdr + listing_text)
+                    with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
+                        f.write(STUB_DXBC)
+                    with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
+                        f.write(fssm_blob)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", ResourceWarning)
+                        spv = rdna2spirv.translate(s_path)
+                        gc.collect()
+                _validate_spirv(name, spv)
+                return spv
+            finally:
+                rdna2spirv.WAVE64_EMULATE = prev_emu
+
+        def run_raw_cs(spv, wave_size, emulate):
+            mem = _run_cs_words(spv, wave_size, emulate, code_base=0)
+            return [[mem[16 * lane + 4 * k] for k in range(4)] for lane in range(wave_size)]
+
+        # Sanity-check the Python decoder's exact raw-byte outputs for the odd encodings.
+        dec105 = rdna2_decode.decode_bytes(sop1(0x1F, 105, 0))["insns"]
+        self.assertEqual(dec105[0]["args"], [{"k": "slist", "r": [105, "vcc_lo"], "n": 2}])
+        dec1 = rdna2_decode.decode_bytes(sop1(0x1F, 1, 0))["insns"]
+        self.assertEqual(dec1[0]["args"], [{"k": "sgpr", "r": 1, "n": 2, "neg": False, "abs": False}])
+
+        # 1. Valid destinations: aligned s[104:105], vcc, and null match across Python decoder and LLVM-formatted listing.
+        valid_cases = (
+            ("s104", 104, [nxt, 0, 37, 47]),
+            ("vcc", 106, [17, 29, nxt, 0]),
+            ("null", 125, [17, 29, 37, 47]),
+        )
+        for label, sdst, expected in valid_cases:
+            code = raw_program(sdst)
+            for wave_size, emulate in ((32, False), (64, False), (64, True)):
+                with self.subTest(backend="python", case=label, wave_size=wave_size, emulate=emulate):
+                    py_text, bad, err = shader_disasm.disasm(code, "gfx1013", backend="python", wave32=(wave_size == 32))
+                    self.assertEqual((bad, err), (0, ""))
+                    spv = translate_raw(f"py_{label}_w{wave_size}_{int(emulate)}", code, py_text, wave_size, emulate)
+                    self.assertEqual(run_raw_cs(spv, wave_size, emulate), [expected] * wave_size)
+
+        # 2. Odd destinations (SDST 105 = 00 1f e9 be, SDST 1 = 00 1f 81 be): refused on BOTH disassembler paths.
+        odd_cases = (
+            ("odd105", 105, 104),
+            ("odd1", 1, 0),
+        )
+        for label, odd_sdst, even_sdst in odd_cases:
+            odd_code = raw_program(odd_sdst)
+            even_code = raw_program(even_sdst)
+            for wave_size, emulate in ((32, False), (64, False), (64, True)):
+                with self.subTest(backend="python", case=label, wave_size=wave_size, emulate=emulate):
+                    py_text, bad, err = shader_disasm.disasm(odd_code, "gfx1013", backend="python",
+                                                             wave32=(wave_size == 32))
+                    self.assertEqual((bad, err), (0, ""))
+                    with self.assertRaisesRegex(rdna2spirv.Unsupported, "s_getpc_b64 destination"):
+                        translate_raw(f"py_{label}_w{wave_size}_{int(emulate)}", odd_code, py_text, wave_size, emulate)
+
+                with self.subTest(backend="llvm_normalized_check", case=label, wave_size=wave_size, emulate=emulate):
+                    # LLVM prints the masked even pair and re-encodes the even SDST; check_printed_encodings refuses it.
+                    llvm_like_text, bad, err = shader_disasm.disasm(even_code, "gfx1013", backend="python",
+                                                                    wave32=(wave_size == 32))
+                    self.assertEqual((bad, err), (0, ""))
+                    with self.assertRaisesRegex(rdna2spirv.Unsupported, "the blob holds .* LLVM printed"):
+                        translate_raw(f"llvm_{label}_w{wave_size}_{int(emulate)}", odd_code, llvm_like_text,
+                                      wave_size, emulate)
+
+        # 3. When llvm-mc is installed locally, exercise the live llvm-mc backend directly on all 5 raw byte blobs.
+        probe_asm, probe_bad, probe_err = shader_disasm.run_mc(bytes.fromhex("00 00 81 bf"), "gfx1013", wave32=True)
+        if probe_bad == 0 and "s_endpgm" in probe_asm and not probe_err:
+            for label, sdst, expected in valid_cases:
+                code = raw_program(sdst)
+                for wave_size, emulate in ((32, False), (64, False), (64, True)):
+                    with self.subTest(backend="llvm-mc", case=label, wave_size=wave_size, emulate=emulate):
+                        mc_text, bad, _ = shader_disasm.disasm(code, "gfx1013", backend="llvm-mc",
+                                                               wave32=(wave_size == 32))
+                        self.assertEqual(bad, 0)
+                        spv = translate_raw(f"mc_{label}_w{wave_size}_{int(emulate)}", code, mc_text,
+                                            wave_size, emulate)
+                        self.assertEqual(run_raw_cs(spv, wave_size, emulate), [expected] * wave_size)
+            for label, odd_sdst, _ in odd_cases:
+                odd_code = raw_program(odd_sdst)
+                for wave_size, emulate in ((32, False), (64, False), (64, True)):
+                    with self.subTest(backend="llvm-mc", case=label, wave_size=wave_size, emulate=emulate):
+                        mc_text, _, _ = shader_disasm.disasm(odd_code, "gfx1013", backend="llvm-mc",
+                                                             wave32=(wave_size == 32))
+                        with self.assertRaises(rdna2spirv.Unsupported):
+                            translate_raw(f"mc_{label}_w{wave_size}_{int(emulate)}", odd_code, mc_text,
+                                          wave_size, emulate)
 
     def test_null_destination_discards_result_without_codebase(self):
         lines = [
@@ -418,7 +568,7 @@ class GetPcDestinationTests(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[:2], [0x11112222, 0x33334444])
 
-    def test_far_branch_using_vcc_and_slist(self):
+    def test_far_branch_using_vcc(self):
         # Forward far branch over a poison write, plus backward loop via s_sub_u32 / s_subb_u32 using vcc.
         # Byte offsets:
         #   0:  s_mov_b32 s10, 0            (4B)
@@ -461,23 +611,9 @@ class GetPcDestinationTests(unittest.TestCase):
                 self.assertEqual(gen.wave64, wave_size == 64)
                 self.assertEqual(support.mrt0_words(spv), [3, 3, 3, 3])
 
-        # Forward far branch using [s105,vcc_lo].
-        slist_lines = [
-            f"s_mov_b32 s10, 7 {_enc(4)}",
-            f"s_getpc_b64 [s105,vcc_lo] ; encoding: [0x00,0x1f,0xe9,0xbe]",
-            f"s_add_u32 s105, s105, 20 {_enc(8)}",
-            f"s_addc_u32 vcc_lo, vcc_lo, 0 {_enc(4)}",
-            f"s_setpc_b64 [s105,vcc_lo] {_enc(4)}",
-            f"s_mov_b32 s10, 99 {_enc(4)}",
-            f"v_mov_b32_e32 v4, s10 {_enc(4)}",
-            f"exp mrt0 v4, v4, v4, v4 done vm {_enc(8)}",
-            f"s_endpgm {_enc(4)}",
-        ]
-        spv_s, _ = _translate_ps("far_slist", slist_lines, wave_size=32)
-        self.assertEqual(support.mrt0_words(spv_s), [7, 7, 7, 7])
-
     def test_invalid_destinations_and_missing_encoding_are_rejected(self):
-        for bad_dst in ("exec", "m0", "vcc_lo", "vcc_hi", "ttmp[0:1]", "s4", "s[4:7]", "v[0:1]"):
+        for bad_dst in ("exec", "m0", "vcc_lo", "vcc_hi", "ttmp[0:1]", "s4", "s[4:7]",
+                        "s[1:2]", "s[105:106]", "[s105,vcc_lo]", "v[0:1]"):
             with self.subTest(bad_dst=bad_dst):
                 lines = [
                     f"s_getpc_b64 {bad_dst} {_enc(4)}",
@@ -488,7 +624,7 @@ class GetPcDestinationTests(unittest.TestCase):
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, "s_getpc_b64 destination"):
                     _translate_ps("getpc_bad_dst", lines, wave_size=32)
 
-        for dst in ("vcc", "[s105,vcc_lo]", "null"):
+        for dst in ("s[4:5]", "vcc", "null"):
             with self.subTest(missing_enc_dst=dst):
                 lines = [
                     f"s_getpc_b64 {dst}",
