@@ -138,6 +138,19 @@ def _safe_component(value, field):
     return value
 
 
+def _path_under_root(root, path, field):
+    """Resolve path and reject symlinks that lead outside the configured root."""
+    real_root = os.path.realpath(os.path.abspath(root))
+    real_path = os.path.realpath(os.path.abspath(path))
+    try:
+        common = os.path.commonpath((real_root, real_path))
+    except ValueError:  # different drives on Windows
+        common = ""
+    if os.path.normcase(common) != os.path.normcase(real_root):
+        raise ValueError(f"{field} resolves outside its root: {path!r}")
+    return real_path
+
+
 def export_one(t, carve, out, blob_cache, png=False):
     fmt = t["fmt"]
     if fmt not in FMT:
@@ -155,7 +168,10 @@ def export_one(t, carve, out, blob_cache, png=False):
         blob_cache.clear()
         parts = []
         for off in chain_offs:
-            with open(os.path.join(carve, archive_rel, f"{off:012x}.bin"), "rb") as f:
+            blob_path = _path_under_root(
+                carve, os.path.join(carve, archive_rel, f"{off:012x}.bin"), "carve input"
+            )
+            with open(blob_path, "rb") as f:
                 parts.append(f.read())
         blob_cache[key] = b"".join(parts)
     G = blob_cache[key]
@@ -180,10 +196,11 @@ def export_one(t, carve, out, blob_cache, png=False):
     cands.sort(key=lambda c: c[0])
     s, place, payload = cands[0]
     name = f"{t['cpu']:012x}_{t['q_index']}_{w}x{h}_{fmt_name}.dds"
-    d = os.path.join(out, archive_rel)
+    d = _path_under_root(out, os.path.join(out, archive_rel), "export directory")
     os.makedirs(d, exist_ok=True)
+    d = _path_under_root(out, d, "export directory")
     dds = dds_bytes(w, h, fmt, payload)
-    dds_path = os.path.join(d, name)
+    dds_path = _path_under_root(out, os.path.join(d, name), "DDS output")
     try:
         with open(dds_path, "wb") as f:
             f.write(dds)
@@ -197,7 +214,7 @@ def export_one(t, carve, out, blob_cache, png=False):
     t["export"] = {"file": name, "place": place, "score": round(s, 4), "heuristic": len(cands) > 1 and chain > top}
     if png:
         import dds_png  # lazy: only --png pays for it
-        png_path = os.path.join(d, name[:-4] + ".png")
+        png_path = _path_under_root(out, os.path.join(d, name[:-4] + ".png"), "PNG output")
         try:
             data = dds_png.dds_to_png_bytes(dds)
             with open(png_path, "wb") as f:
@@ -291,7 +308,11 @@ def main(argv=None):
     if os.path.exists(a.out) and not os.path.isdir(a.out):
         print(f"ERROR: {a.out} is a file, not a folder", file=sys.stderr)
         return 2
-    report = os.path.join(a.out, "export_log.json")
+    try:
+        report = _path_under_root(a.out, os.path.join(a.out, "export_log.json"), "export log")
+    except ValueError as e:
+        print(f"ERROR: cannot write export log: {e}", file=sys.stderr)
+        return 2
     if same_report_path(report, a.index):
         print(f"ERROR: {report} must not overwrite input index {a.index}", file=sys.stderr)
         return 2
@@ -317,11 +338,11 @@ def main(argv=None):
             pngs[t["export"]["png"]] += 1
         if i % 2000 == 0:
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
-    report = os.path.join(a.out, "export_log.json")
+    report = _path_under_root(a.out, os.path.join(a.out, "export_log.json"), "export log")
     try:
         _write_json_atomic(report, texs)
-    except OSError as e:
-        print(f"ERROR: cannot write {report}: {e.strerror or e}", file=sys.stderr)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot write {report}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
         return 1
     print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
     if a.png:
